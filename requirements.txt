@@ -1,0 +1,6 @@
+h5py==3.14.0
+numpy==2.3.2
+dask==2025.7.0
+tqdm==4.67.1
+psutil==7.0.0
+matplotlib==3.10.5

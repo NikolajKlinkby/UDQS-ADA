@@ -1,0 +1,223 @@
+import h5py as h5
+import numpy as np
+import os
+import dask.array as da
+from scipy.optimize import least_squares
+
+def process_model_chunk(
+    chunk_idx,
+    chunk_indices,
+    arr_name,
+    angles,
+    virtual_file_path,
+    tmp_dir,
+    counter,
+    lock,
+    batch_size=10,
+    method='projection',
+    harmonics=(0,4,8),
+    reg=1e-8,
+    weights=None,
+    robust=False,
+    use_scan_avg=False,
+    reduced_scan_path=None,
+):
+    safe_arr_name = arr_name.replace('/', '_')
+    tmp_path = os.path.join(tmp_dir, f"chunk_{chunk_idx}_{safe_arr_name.replace('/','_')}.h5")
+    # determine number of coefficients from requested harmonics
+    A, keys = build_design_matrix(angles, harmonics)
+    n_coeffs = len(keys)
+
+    # ensure tmp dir exists
+    os.makedirs(tmp_dir, exist_ok=True)
+
+    # If using pre-averaged scan data, read from reduced file; otherwise read from virtual VDS
+    if use_scan_avg:
+        # try to infer reduced_scan_path if not provided
+        if reduced_scan_path is None:
+            reduced_scan_path = virtual_file_path.replace('_VirtualData.h5', '_ReducedScan.h5')
+            if not os.path.exists(reduced_scan_path):
+                reduced_scan_path = os.path.join(os.path.dirname(virtual_file_path), 'ReducedScan.h5')
+
+        with h5.File(reduced_scan_path, 'r') as f_red, h5.File(tmp_path, 'a', rdcc_nbytes=1024*1024, rdcc_nslots=1000, rdcc_w0=0) as f_tmp:
+            # try candidate names: arr_name, arr_name + '_mean', arr_name + '_sum'
+            candidates = [arr_name, f"{arr_name}_mean", f"{arr_name}_sum"]
+            dset_red = None
+            for c in candidates:
+                if c in f_red:
+                    dset_red = f_red[c]
+                    break
+
+            if dset_red is None:
+                raise KeyError(f"Could not find reduced dataset for '{arr_name}' in {reduced_scan_path}; tried: {candidates}")
+
+            # infer last-dimension size (pairs) from reduced dataset
+            shape_red = dset_red.shape
+            # expected dset_red[idx] -> shape (n_angles, n_pairs)
+            pairs = shape_red[-1]
+
+            chunk = (1, n_coeffs, pairs)
+            new_shape = (len(chunk_indices), n_coeffs, pairs)
+            dset_m = f_tmp.create_dataset(arr_name, shape=new_shape, dtype='f', chunks=chunk)
+
+            local_count = 0
+            for idx, i in enumerate(chunk_indices):
+                arr_avg = dset_red[i]
+                coef = get_model(arr_avg, angles, method=method, harmonics=harmonics, reg=reg, weights=weights, robust=robust)
+                # ensure returned coef has shape (n_coeffs, pairs) or (n_coeffs,)
+                coef = np.asarray(coef)
+                if coef.ndim == 1:
+                    coef = coef.reshape((coef.shape[0], 1))
+                dset_m[idx] = coef
+                local_count += 1
+                if local_count % batch_size == 0 or idx == len(chunk_indices) - 1:
+                    with lock:
+                        counter.value += local_count
+                    local_count = 0
+    else:
+        with h5.File(virtual_file_path, 'r', rdcc_nbytes=1024*1024, rdcc_nslots=1000, rdcc_w0=0) as f_in, h5.File(tmp_path, 'a', rdcc_nbytes=1024*1024, rdcc_nslots=1000, rdcc_w0=0) as f_tmp:
+            dset = f_in[arr_name]
+            shape = dset.shape
+            chunk = (1, shape[1], shape[-1])
+            darr = da.from_array(dset, chunks=chunk)
+
+            pairs = shape[-1]
+            chunk = (1, n_coeffs, pairs)
+            new_shape = (len(chunk_indices), n_coeffs, pairs)
+            dset_m = f_tmp.create_dataset(arr_name, shape=new_shape, dtype='f', chunks=chunk)
+
+            local_count = 0
+            for idx, i in enumerate(chunk_indices):
+                data = darr[i].compute()
+                coef = get_model(data, angles, method=method, harmonics=harmonics, reg=reg, weights=weights, robust=robust)
+                coef = np.asarray(coef)
+                if coef.ndim == 1:
+                    coef = coef.reshape((coef.shape[0], 1))
+                dset_m[idx] = coef
+                local_count += 1
+                if local_count % batch_size == 0 or idx == len(chunk_indices) - 1:
+                    with lock:
+                        counter.value += local_count
+                    local_count = 0
+
+    return tmp_path, chunk_indices, arr_name
+
+def build_design_matrix(angles, harmonics):
+    """
+    Build design matrix A for harmonic regression.
+    angles: 1D array (n_angles,) in radians
+    harmonics: iterable of ints (e.g. [0,1,2,4,8])
+      - if 0 in harmonics -> column of ones (DC)
+      - for k>0 -> columns [cos(k*theta), sin(k*theta)]
+    Returns A (n_angles, n_cols) and a list of keys describing columns in order.
+    """
+    thetas = np.asarray(angles)
+    cols = []
+    keys = []
+    if 0 in harmonics:
+        cols.append(np.ones_like(thetas))
+        keys.append('I0')
+    for k in harmonics:
+        if k == 0:
+            continue
+        cols.append(np.cos(k * thetas))
+        keys.append(f'I{int(k)}c')
+        cols.append(np.sin(k * thetas))
+        keys.append(f'I{int(k)}s')
+    A = np.vstack(cols).T  # shape (n_angles, n_cols)
+    return A, keys
+
+def fit_harmonics(arr, angles, harmonics=(0,4,8), reg=1e-8, weights=None, robust=False):
+    """
+    Fit harmonic coefficients to angle-dependent data.
+    arr: ndarray with angles on axis 0, remaining dims (e.g. scans, steps)
+         shape (n_angles, N) or (n_angles, n_scans, n_steps)
+    angles: 1D angles array length n_angles
+    harmonics: iterable of ints
+    reg: Tikhonov regularization scalar (applied to normal matrix)
+    weights: optional per-angle weights (length n_angles) for weighted LS
+    robust: if True, fall back to per-column Huber loss fitting (slower)
+    Returns: coeffs array shape (n_coeffs, ...) (aligned to input remaining dims),
+             and keys (list of column descriptors).
+    """
+    A, keys = build_design_matrix(angles, harmonics)
+    n_angles, n_cols = A.shape
+
+    flat = False
+    arr = np.asarray(arr)
+    if arr.ndim == 1:
+        flat = True
+        Y = arr.reshape(n_angles, 1)
+    else:
+        Y = arr.reshape(n_angles, -1)
+
+    # apply weights if given
+    if weights is not None:
+        w = np.asarray(weights).reshape(-1, 1)
+        A_w = A * w
+        Y_w = Y * w
+    else:
+        A_w = A
+        Y_w = Y
+
+    # Precompute regularized inverse (normal equations)
+    ATA = A_w.T @ A_w  # (n_cols, n_cols)
+    if reg is not None and reg > 0:
+        ATA = ATA + reg * np.eye(ATA.shape[0])
+    ATY = A_w.T @ Y_w  # (n_cols, n_pairs)
+    try:
+        coef = np.linalg.solve(ATA, ATY)
+    except np.linalg.LinAlgError:
+        coef = np.linalg.pinv(ATA) @ ATY
+
+    # If robust requested, optionally refine each column with Huber (slower)
+    if robust:
+        def residuals(c, Acol, y):
+            return Acol @ c - y
+
+        # for each column of Y, run least_squares with loss='huber'
+        for j in range(ATY.shape[1]):
+            yj = Y[:, j]
+            x0 = coef[:, j]
+            res = least_squares(lambda x: residuals(x, A, yj), x0, loss='huber')
+            coef[:, j] = res.x
+
+    # reshape coef back to original trailing dims
+    out_shape = arr.shape[1:] if arr.ndim > 1 else ()
+    coef = coef.reshape((n_cols,) + out_shape)
+    return coef, keys
+
+def get_model(arr, angles, method='projection', harmonics=(0,4,8), reg=1e-8, weights=None, robust=False):
+    """
+    Compute model coefficients from angle-dependent data.
+    - `method='projection'` uses trapezoidal projection
+    - `method in ('lsq','lsq_robust')` uses linear least-squares fit to requested harmonics
+    Returns coefficients array with ordering matching the requested harmonics' columns.
+    """
+    method = method.lower()
+    if method == 'projection':
+        coef = []
+        for k in harmonics:
+            if k == 0:
+                integral = np.average(arr, axis=0)
+                coef.append(integral)
+            else:
+                cos = np.cos(k * angles)
+                sin = np.sin(k * angles)
+                extra_axes = max(0, arr.ndim - 1)
+                if extra_axes:
+                    idx = (slice(None),) + (None,) * extra_axes
+                    cos = cos[idx]
+                    sin = sin[idx]
+                integral_c = np.trapezoid(arr * cos, angles, axis=0) / np.trapezoid(cos**2, angles, axis=0)
+                integral_s = np.trapezoid(arr * sin, angles, axis=0) / np.trapezoid(sin**2, angles, axis=0)
+                coef.append(integral_c)
+                coef.append(integral_s)
+        return np.array(coef)
+    elif method in ('lsq', 'lsq_robust'):
+        do_robust = robust or (method == 'lsq_robust')
+        coef, keys = fit_harmonics(arr, angles, harmonics=harmonics, reg=reg, weights=weights, robust=do_robust)
+        # coef shape (n_keys, ...) return as-is
+        return coef
+    else:
+        raise ValueError(f"Unknown method '{method}' for get_model")
