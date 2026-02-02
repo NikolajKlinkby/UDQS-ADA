@@ -280,12 +280,11 @@ def _create_virtual_file(runnr, dataDir, fileprefix='File', overwrite=None):
                             ds_grp.create_dataset("dset_names", data=dset_names)
                             ds_grp.create_dataset("shapes", data=shapes)
                             ds_grp.create_dataset("dtypes", data=dtypes)
+                            
                     if 'scan_step' in scan_val_dict:
                         val, idx = np.unique(scan_val_dict['scan_step'], return_index=True)
                         idx = idx[val != -1]
-                        diff = np.diff(idx) < 0
-                        if diff.any():
-                            idx = idx[:np.where(diff)[0][0]]
+                        
                         for key in scan_val_dict.keys():
                             if 'scan_step' not in key:
                                 if 'step_'+ key in vds:
@@ -348,12 +347,11 @@ def _create_virtual_file(runnr, dataDir, fileprefix='File', overwrite=None):
         if 'scan_step' in scan_val_dict:
             val, idx = np.unique(scan_val_dict['scan_step'], return_index=True)
             idx = idx[val != -1]
-            diff = np.diff(idx) < 0
-            if diff.any():
-                idx = idx[:np.where(diff)[0][0]]
+            
             for key in scan_val_dict.keys():
                 if 'scan_step' not in key:
                     if 'step_'+ key in vds:
                         del vds['step_'+key]
+                        
                     vds.create_dataset('step_'+key, data=scan_val_dict[key][idx])
     return 1
