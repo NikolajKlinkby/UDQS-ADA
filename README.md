@@ -3,12 +3,19 @@ Data Analysis API
 
 Overview
 --------
-The `data_analysis_api` package provides utilities to build and process
+The `UDQS-ADA` package provides utilities to build and process
 virtual HDF5 datasets for angular- and spatially-resolved pump-probe
 measurements. It orchestrates creation of Virtual Dataset (VDS) files,
 computation of scan-averaged reduced datasets, model parameter extraction
 from angular-resolved data, and creation of boolean masks for event
 selection.
+
+Installation
+------------
+Install the package and its dependencies using pip from the pyproject.toml:
+```bash
+pip install -e .
+```
 
 Main functions
 --------------
@@ -46,7 +53,7 @@ Quick usage examples (from included scripts)
 Example: single run with scan averaging and model
 
 ```python
-import data_analysis_api as api
+import udqs_ada as api
 
 data_folder = "data_folder"
 runnr = ['068']
@@ -108,7 +115,7 @@ api.compute_model(
 Example: single run with masking
 
 ```python
-import data_analysis_api as api
+import udqs_ada as api
 
 data_folder = "data_folder"
 runnr = ['064']
@@ -153,7 +160,7 @@ api.compute_model(
 Example: multiple-run processing
 
 ```python
-import data_analysis_api as api
+import udqs_ada as api
 
 data_folder = "data_folder"
 runnr = ['070', '071', '072', '073', '074']

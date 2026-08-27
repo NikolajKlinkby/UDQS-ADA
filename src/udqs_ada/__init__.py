@@ -2,9 +2,6 @@
 
 Expose the main functions for creating virtual datasets, computing scan
 averages and computing fits.
-
-This file performs explicit imports so IDEs (Pyright/Pylance, Jedi)
-can discover symbols for autocompletion and signature help.
 """
 from .api import (
     create_virtual_file,
