@@ -7,7 +7,7 @@ name = "udqs-ada"
 dynamic = ["version", "dependencies"]
 description = "Data Analysis API: virtual datasets, scan averages, and fits"
 readme = "README.md"
-requires-python = ">=3.9"
+requires-python = ">=3.11"
 license = { text = "MIT" }
 authors = [
     { name = "Nikolaj Klinkby", email = "nikolaj.klinkby@gmail.com" }
