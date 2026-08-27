@@ -73,7 +73,7 @@ def process_chunk(chunk_idx, chunk_indices, mask, arr, remaining_idx, virtual_fi
                     mean_step = np.zeros(_data_shape[1:], dtype=float)
                     mean_std_step = np.zeros(_data_shape[1:], dtype=float)
                 elif len(indices) == 1:
-                    mean_step = np.array(data[indices[0]], dtype=float)
+                    mean_step = np.array(np.where(ref_data[indices[0]]!=0, data[indices[0]]/ref_data[indices[0]], 0), dtype=float) if ref_arr_available else np.array(data[indices[0]], dtype=float)
                     mean_std_step = np.zeros_like(mean_step)
                 else:
                     block = np.where(ref_data[indices]!=0, data[indices]/ref_data[indices], 0) if ref_arr_available else data[indices]
