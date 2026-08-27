@@ -44,7 +44,7 @@ def process_chunk(chunk_idx, chunk_indices, mask, arr, remaining_idx, virtual_fi
         if data_ndim == 1 or 'scan_step_mask' in arr_name:
             return tmp_path, chunk_indices, arr_name
 
-        chunk_shape = (1, _data_shape[1], _data_shape[2]) if data_ndim == 3 else (1, _data_shape[1])
+        chunk_shape = (1,) + _data_shape[1:]
         data_shape = (len(chunk_indices),) + _data_shape[1:]
         if sum_mode:
             sum_key = f"{arr_name}_sum"

@@ -459,7 +459,7 @@ def compute_scan_avg(runnr, dataDir, arrays, n_std_filter=1.0, use_mask=None, me
 
 def compute_model(runnr, dataDir, arrays, n_workers=6, method='projection', 
                 harmonics=(0,4,8), reg=1e-8, robust=False, 
-                use_scan_avg=False):
+                use_scan_avg=False, angle_index = 1):
     """
     Compute model parameters from angular-resolved datasets using parallel
     processing and write results to `Run-<runnr>_ModelData.h5`.
@@ -492,6 +492,8 @@ def compute_model(runnr, dataDir, arrays, n_workers=6, method='projection',
         Whether to use robust fitting options.
     - use_scan_avg: bool, optional
         If True, use reduced-scan data during model calculations.
+    - angle_index: int, optional
+        Index of the angle dimension in the datasets (default 1).
 
     Returns:
     - None
@@ -581,14 +583,14 @@ def compute_model(runnr, dataDir, arrays, n_workers=6, method='projection',
         shape = dset.shape
         del dset
     # Make some static arrays used in the modeling
-    angles = np.linspace(0, np.pi * 2, shape[1])
+    angles = np.linspace(0, np.pi * 2, shape[angle_index])
 
     # Check all arrays have the same leading dimension
     arrays_to_remove = []
     with h5.File(array_path, 'r') as f_scan:
         for arr_name in arrays:
             dset = f_scan[arr_name]
-            if dset.shape[1] != shape[1]:
+            if dset.shape[angle_index] != shape[angle_index]:
                 # Remove array from list if leading dimension does not match
                 arrays_to_remove.append(arr_name)
     
@@ -639,6 +641,7 @@ def compute_model(runnr, dataDir, arrays, n_workers=6, method='projection',
                                 robust=robust,
                                 use_scan_avg=use_scan_avg,
                                 reduced_scan_path=reduced_scan_path,
+                                angle_index=angle_index,
                             )
                         )
             active_bars = {}

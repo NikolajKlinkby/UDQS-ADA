@@ -21,6 +21,7 @@ def process_model_chunk(
     robust=False,
     use_scan_avg=False,
     reduced_scan_path=None,
+    angle_index=1,
 ):
     safe_arr_name = arr_name.replace('/', '_')
     tmp_path = os.path.join(tmp_dir, f"chunk_{chunk_idx}_{safe_arr_name.replace('/','_')}.h5")
@@ -53,21 +54,35 @@ def process_model_chunk(
 
             # infer last-dimension size (pairs) from reduced dataset
             shape_red = dset_red.shape
-            # expected dset_red[idx] -> shape (n_angles, n_pairs)
-            pairs = shape_red[-1]
+            ndim_red = len(shape_red)
+            item_axis = 0
 
-            chunk = (1, n_coeffs, pairs)
-            new_shape = (len(chunk_indices), n_coeffs, pairs)
+            if not (0 <= angle_index < ndim_red):
+                raise ValueError(
+                    f"angle_index={angle_index} is out of range for dataset '{arr_name}' "
+                    f"with shape {shape_red}"
+                )
+            if angle_index == item_axis:
+                raise ValueError(
+                    f"angle_index cannot be {item_axis}; that axis is used to index chunk items"
+                )
+
+            angle_axis_in_slice = angle_index - 1
+ 
+            rest_shape = tuple(
+                s for ax, s in enumerate(shape_red) if ax not in (item_axis, angle_index)
+            )
+ 
+            chunk = (1, n_coeffs) + rest_shape
+            new_shape = (len(chunk_indices), n_coeffs) + rest_shape
             dset_m = f_tmp.create_dataset(arr_name, shape=new_shape, dtype='f', chunks=chunk)
-
+            
             local_count = 0
             for idx, i in enumerate(chunk_indices):
-                arr_avg = dset_red[i]
+                arr_avg = np.moveaxis(dset_red[i], angle_axis_in_slice, 0)
                 coef = get_model(arr_avg, angles, method=method, harmonics=harmonics, reg=reg, weights=weights, robust=robust)
                 # ensure returned coef has shape (n_coeffs, pairs) or (n_coeffs,)
                 coef = np.asarray(coef)
-                if coef.ndim == 1:
-                    coef = coef.reshape((coef.shape[0], 1))
                 dset_m[idx] = coef
                 local_count += 1
                 if local_count % batch_size == 0 or idx == len(chunk_indices) - 1:
@@ -78,21 +93,37 @@ def process_model_chunk(
         with h5.File(virtual_file_path, 'r', rdcc_nbytes=1024*1024, rdcc_nslots=1000, rdcc_w0=0) as f_in, h5.File(tmp_path, 'a', rdcc_nbytes=1024*1024, rdcc_nslots=1000, rdcc_w0=0) as f_tmp:
             dset = f_in[arr_name]
             shape = dset.shape
-            chunk = (1, shape[1], shape[-1])
-            darr = da.from_array(dset, chunks=chunk)
+            ndim = len(shape)
+            item_axis = 0
+            
+            if not (0 <= angle_index < ndim):
+                raise ValueError(
+                    f"angle_index={angle_index} is out of range for dataset '{arr_name}' "
+                    f"with shape {shape}"
+                )
+            if angle_index == item_axis:
+                raise ValueError(
+                    f"angle_index cannot be {item_axis}; that axis is used to index chunk items"
+                )
 
-            pairs = shape[-1]
-            chunk = (1, n_coeffs, pairs)
-            new_shape = (len(chunk_indices), n_coeffs, pairs)
+            angle_axis_in_slice = angle_index - 1
+    
+            rest_shape = tuple(
+                s for ax, s in enumerate(shape) if ax not in (item_axis, angle_index)
+            )
+
+            chunk = (1,) + shape[1:]
+            darr = da.from_array(dset, chunks=chunk)
+    
+            chunk = (1, n_coeffs) + rest_shape
+            new_shape = (len(chunk_indices), n_coeffs) + rest_shape
             dset_m = f_tmp.create_dataset(arr_name, shape=new_shape, dtype='f', chunks=chunk)
 
             local_count = 0
             for idx, i in enumerate(chunk_indices):
-                data = darr[i].compute()
+                data = np.moveaxis(darr[i].compute(), angle_axis_in_slice, 0)
                 coef = get_model(data, angles, method=method, harmonics=harmonics, reg=reg, weights=weights, robust=robust)
                 coef = np.asarray(coef)
-                if coef.ndim == 1:
-                    coef = coef.reshape((coef.shape[0], 1))
                 dset_m[idx] = coef
                 local_count += 1
                 if local_count % batch_size == 0 or idx == len(chunk_indices) - 1:
