@@ -499,16 +499,6 @@ def compute_model(runnr, dataDir, arrays, n_workers=6, method='projection',
     - None
         Model datasets are written into `Run-<runnr>_ModelData.h5`.
     """
-    # NOTE: The `robust` option is currently not implemented.
-    # If `robust=True` is passed, a UserWarning will be issued and
-    # the function will proceed with `robust=False` behavior.
-    # This is intentionally non-fatal to preserve existing workflows.
-    if robust:
-        warnings.warn(
-            "compute_model: parameter `robust=True` is implemented wrong and causes crashes; proceeding with robust=False",
-            UserWarning,
-        )
-        robust = False
     # Determine file paths and prepare temporary directory
     if isinstance(runnr, (list, tuple, np.ndarray)):
         if isinstance(runnr,tuple):

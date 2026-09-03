@@ -158,6 +158,103 @@ def build_design_matrix(angles, harmonics):
     A = np.vstack(cols).T  # shape (n_angles, n_cols)
     return A, keys
 
+def robust_ridge_irls(A, Y, coef, reg=1e-8, weights=None,
+                      max_iter=8, tol=1e-6):
+    """
+    Robust ridge regression using vectorized IRLS.
+
+    Parameters
+    ----------
+    A : (m,p)
+        Design matrix.
+    Y : (m,n)
+        One column per spectrum.
+    coef : (p,n)
+        Initial ridge solution.
+    reg : float
+    weights : (m,) or None
+        Optional measurement weights.
+    """
+
+    m, p = A.shape
+    n = Y.shape[1]
+
+    if weights is None:
+        meas_w = np.ones(m)
+    else:
+        meas_w = np.asarray(weights)
+
+    I = np.eye(p)
+
+    for _ in range(max_iter):
+
+        # --------------------------------------------------------
+        # Residuals for ALL spectra
+        # --------------------------------------------------------
+
+        R = A @ coef - Y           # (m,n)
+        R *= meas_w[:, None]
+
+        # --------------------------------------------------------
+        # Robust scale estimate (MAD)
+        # --------------------------------------------------------
+
+        med = np.median(R, axis=0)
+        scale = 1.4826 * np.median(
+            np.abs(R - med[None, :]),
+            axis=0
+        )
+        scale = np.maximum(scale, 1e-12)
+
+        # --------------------------------------------------------
+        # Huber weights
+        # --------------------------------------------------------
+
+        t = np.abs(R) / scale[None, :]
+
+        W = np.ones_like(R)
+        mask = t > 1
+        W[mask] = 1 / t[mask]
+        W_total = W * meas_w[:, None]
+
+        # --------------------------------------------------------
+        # Solve each spectrum
+        # --------------------------------------------------------
+
+        ATA = np.einsum(
+            "ma,mb,mn->nab",
+            A,
+            A,
+            W_total,
+            optimize=True,
+        )
+        ATY = np.einsum(
+            "ma,mn,mn->na",
+            A,
+            W_total,
+            Y,
+            optimize=True,
+        )
+
+        ATA += reg * I
+
+        coef_new = np.linalg.solve(
+            ATA,
+            ATY[..., None]
+        )[..., 0].T
+
+        # --------------------------------------------------------
+        # Convergence
+        # --------------------------------------------------------
+
+        delta = np.max(np.abs(coef_new - coef))
+        coef = coef_new
+
+        if delta < tol:
+            break
+
+    return coef
+
 def fit_harmonics(arr, angles, harmonics=(0,4,8), reg=1e-8, weights=None, robust=False):
     """
     Fit harmonic coefficients to angle-dependent data.
@@ -174,22 +271,22 @@ def fit_harmonics(arr, angles, harmonics=(0,4,8), reg=1e-8, weights=None, robust
     A, keys = build_design_matrix(angles, harmonics)
     n_angles, n_cols = A.shape
 
-    flat = False
+    if weights is None:
+        w_vec = np.ones(n_angles)
+        w_mat = w_vec[:, None]
+    else:
+        w_vec = np.asarray(weights)
+    w_mat = w_vec[:, None]
+
     arr = np.asarray(arr)
     if arr.ndim == 1:
-        flat = True
         Y = arr.reshape(n_angles, 1)
     else:
         Y = arr.reshape(n_angles, -1)
 
     # apply weights if given
-    if weights is not None:
-        w = np.asarray(weights).reshape(-1, 1)
-        A_w = A * w
-        Y_w = Y * w
-    else:
-        A_w = A
-        Y_w = Y
+    A_w = A * w_mat
+    Y_w = Y * w_mat
 
     # Precompute regularized inverse (normal equations)
     ATA = A_w.T @ A_w  # (n_cols, n_cols)
@@ -203,15 +300,13 @@ def fit_harmonics(arr, angles, harmonics=(0,4,8), reg=1e-8, weights=None, robust
 
     # If robust requested, optionally refine each column with Huber (slower)
     if robust:
-        def residuals(c, Acol, y):
-            return Acol @ c - y
-
-        # for each column of Y, run least_squares with loss='huber'
-        for j in range(ATY.shape[1]):
-            yj = Y[:, j]
-            x0 = coef[:, j]
-            res = least_squares(lambda x: residuals(x, A, yj), x0, loss='huber')
-            coef[:, j] = res.x
+        coef = robust_ridge_irls(
+            A,
+            Y,
+            coef,
+            reg=reg,
+            weights=weights,
+        )
 
     # reshape coef back to original trailing dims
     out_shape = arr.shape[1:] if arr.ndim > 1 else ()
