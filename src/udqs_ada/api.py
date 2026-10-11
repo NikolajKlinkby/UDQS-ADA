@@ -16,8 +16,9 @@ from .vds_helpers import (
     list_h5_datasets,
     _create_virtual_file,
 )
-from .mask_helpers import (get_scan_step_mask, calculate_chunk_size)
+from .mask_helpers import (get_scan_step_mask, get_scan_step_groups, calculate_chunk_size)
 from .scan_helpers import (
+    READ_BLOCK_BYTES,
     process_chunk,
     dry_run_process_chunk,
     find_dataset_containing,
@@ -148,9 +149,11 @@ def compute_scan_avg(runnr, dataDir, arrays, n_std_filter=1.0, use_mask=None, me
         Number of standard deviations used to define an acceptance window
         around the median when filtering outliers (default 1.0).
     - use_mask: ndarray or None, optional
-        Boolean mask to combine with computed scan-step mask.
+        Boolean mask, one entry per event (e.g. from `mask_data`), to select the
+        events that go into the averages.
     - memory_fraction: float, optional
-        Fraction used to request memory for mask calculation.
+        No longer used; kept so existing calls keep working. (It set the chunk
+        size for building the scan-step table, which is not built any more.)
     - sum_mode: bool, optional
         If True compute aggregated sums/Counts; otherwise do per-step storage.
     - n_workers: int, optional
@@ -219,13 +222,14 @@ def compute_scan_avg(runnr, dataDir, arrays, n_std_filter=1.0, use_mask=None, me
     # dataset. If `scan_step_array` is provided it will be used to build
     # the scan steps by histogram-binning that 1D array (one bin == one
     # scan step). Optionally provide `n_scan_bins` to override bin count.
-    mask = get_scan_step_mask(runnr, dataDir, memory_fraction=memory_fraction, scan_step_array=scan_step_array, n_scan_bins=n_scan_bins)
+    groups = get_scan_step_groups(runnr, dataDir, scan_step_array=scan_step_array, n_scan_bins=n_scan_bins)
     
     # Check validity of computed mask
     if isinstance(use_mask, np.ndarray):
         if use_mask.sum() == 0:
             raise ValueError("Mask has no truth values")
-        mask = mask * use_mask
+        groups = groups.filtered(use_mask)
+    n_steps, n_events = groups.n_steps, groups.n_events
     # `mask` is a boolean array (per-scan-step) used to include/exclude
     # events during aggregation. If `use_mask` is provided it is applied
     # elementwise (logical AND) with the computed mask.
@@ -328,7 +332,7 @@ def compute_scan_avg(runnr, dataDir, arrays, n_std_filter=1.0, use_mask=None, me
         with ProcessPoolExecutor(max_workers=1) as executor:
             futures = [
                 executor.submit(
-                    dry_run_process_chunk, 0, [0,0,0,0], mask, arrays, remaining_events, virtual_file_path, tmp_dir,
+                    dry_run_process_chunk, 0, [0,0,0,0], None, arrays, remaining_events, virtual_file_path, tmp_dir,
                     sum_mode, n_std_filter
                 )
             ]
@@ -336,8 +340,20 @@ def compute_scan_avg(runnr, dataDir, arrays, n_std_filter=1.0, use_mask=None, me
                 mem = future.result()
                 if mem > max_mem:
                     max_mem = mem
-    max_mem *= 2
-    print(f'Assuming worker size {max_mem:.2f} MB')
+    # A worker holds the events of one scan step at a time. Add that block (and the temporary
+    # copies made while filtering/averaging it) to the measured size of an idle worker.
+    largest_step = int(groups.counts.max()) if n_steps else 0
+    with h5.File(virtual_file_path, 'r') as f:
+        row_bytes = 0
+        for arr in arrays:
+            for name in (arr if isinstance(arr, (list, tuple)) else [arr]):
+                if f[name].ndim > 1:
+                    row_bytes = max(row_bytes, int(np.prod(f[name].shape[1:])) * 8)
+    block_mem = largest_step * row_bytes / (1024 ** 2)
+    # ... plus the batch of events a worker reads at once (the array and its reference array)
+    read_mem = 2 * max(READ_BLOCK_BYTES / (1024 ** 2), block_mem)
+    max_mem = max_mem * 2 + read_mem + 6 * block_mem
+    print(f'Assuming worker size {max_mem:.2f} MB (largest scan step: {largest_step} events, {block_mem:.2f} MB)')
     # Run a single dry-run worker to estimate per-worker memory needs.
     # This allows computing a safe number of parallel workers given
     # current available system memory.
@@ -348,14 +364,16 @@ def compute_scan_avg(runnr, dataDir, arrays, n_std_filter=1.0, use_mask=None, me
     if n_workers > safe_n_workers:
         print(f'Can not allocate {n_workers} workers. Using maximum workers {safe_n_workers}')
         n_workers = safe_n_workers
-    indices_chunks = np.array_split(np.arange(mask.shape[0]), n_workers)
+    indices_chunks = np.array_split(np.arange(n_steps), n_workers)
+    # Each task only gets the event numbers of its own steps
+    events_chunks = [[groups.events(i) for i in chunk] for chunk in indices_chunks]
     
     # Step 4: Spawn parallel workers to process spatial chunks and write
     with Manager() as manager:
         # Setup shared counters and locks for progress tracking
         dataset_counters = {arr: manager.Value('i', 0) for arr in array_names}
         dataset_locks = {arr: manager.Lock() for arr in array_names}
-        dataset_totals = {arr: mask.shape[0] for arr in array_names}
+        dataset_totals = {arr: n_steps for arr in array_names}
         tmp_paths = []
         tmp_indices = []
         arr_names = []
@@ -367,7 +385,7 @@ def compute_scan_avg(runnr, dataDir, arrays, n_std_filter=1.0, use_mask=None, me
                 for idx, chunk in enumerate(indices_chunks):
                     futures.append(
                             executor.submit(
-                                process_chunk, idx, chunk, mask, arr, remaining_idx,
+                                process_chunk, idx, chunk, events_chunks[idx], arr, remaining_idx,
                                 virtual_file_path, tmp_dir, sum_mode, n_std_filter,
                                 dataset_counters[arr_name], dataset_locks[arr_name]
                             )
@@ -418,21 +436,21 @@ def compute_scan_avg(runnr, dataDir, arrays, n_std_filter=1.0, use_mask=None, me
                     
                     # Create or resize the output dataset as needed
                     if key not in f_out:
-                        chunks = (min(1000,mask.shape[0]),) + dset_tmp.shape[1:]
+                        chunks = (min(1000,n_steps),) + dset_tmp.shape[1:]
                         f_out.create_dataset(
                             key,
-                            shape=(mask.shape[0],) + dset_tmp.shape[1:],
+                            shape=(n_steps,) + dset_tmp.shape[1:],
                             dtype=dset_tmp.dtype,
                             chunks=chunks,
                             maxshape=(None,) + dset_tmp.shape[1:],
                         )
                     else:
-                        if f_out[key].shape[0] < mask.shape[0]:
-                            f_out[key].resize((mask.shape[0],) + dset_tmp.shape[1:])
+                        if f_out[key].shape[0] < n_steps:
+                            f_out[key].resize((n_steps,) + dset_tmp.shape[1:])
                     
                     # Merge data from the temporary dataset into the output dataset
                     dset_out = f_out[key]
-                    dset_out.attrs.modify('Events', mask.shape[1])
+                    dset_out.attrs.modify('Events', n_events)
                     for local_idx, global_idx in zip(range(dset_tmp.shape[0]), chunk_indices):
                         # Handle sum/Count datasets by accumulating values
                         if key.endswith('_count') or key.endswith('_sum'):

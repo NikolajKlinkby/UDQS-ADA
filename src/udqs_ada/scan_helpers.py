@@ -8,7 +8,29 @@ import dask.array as da
 def first_diff_index_simple(a: str, b: str) -> int:
     return next((i for i, (x, y) in enumerate(zip(a, b)) if x != y), min(len(a), len(b)))
 
-def process_chunk(chunk_idx, chunk_indices, mask, arr, remaining_idx, virtual_file_path, tmp_dir, sum_mode, n_std_filter, counter, lock, batch_size=10):
+# How much of one array a worker reads from the virtual file in a single call. Every read of a
+# virtual dataset costs time proportional to the number of events in the run, so reading the
+# events of many scan steps together is far cheaper than one read per step.
+READ_BLOCK_BYTES = 64 * 1024 * 1024
+
+
+def read_events(dset, events):
+    """Rows `events` (ascending, unique) of an HDF5 dataset, read as a few contiguous slices
+    where possible (events of neighbouring scan steps are usually neighbours in time)."""
+    if len(events) == 0:
+        return np.empty((0,) + dset.shape[1:], dtype=dset.dtype)
+    breaks = np.nonzero(np.diff(events) != 1)[0] + 1
+    if len(breaks) + 1 > max(8, len(events) // 4):
+        return dset[events]                      # too fragmented: let h5py pick the rows
+    starts = np.concatenate(([0], breaks))
+    stops = np.concatenate((breaks, [len(events)]))
+    parts = [dset[int(events[a]):int(events[b - 1]) + 1] for a, b in zip(starts, stops)]
+    return parts[0] if len(parts) == 1 else np.concatenate(parts, axis=0)
+
+
+def process_chunk(chunk_idx, chunk_indices, step_events, arr, remaining_idx, virtual_file_path, tmp_dir, sum_mode, n_std_filter, counter, lock, batch_size=10):
+    # step_events: one array of event numbers (ascending) per entry of chunk_indices, i.e. only
+    # the events of the steps this worker handles.
     ref_arr_available = isinstance(arr, (list, tuple))
     if ref_arr_available:
         arr_name = arr[0] + '-' + arr[1][first_diff_index_simple(arr[0], arr[1]):]
@@ -24,7 +46,8 @@ def process_chunk(chunk_idx, chunk_indices, mask, arr, remaining_idx, virtual_fi
             
     with h5.File(virtual_file_path, 'r', rdcc_nbytes=1024*1024, rdcc_nslots=1000, rdcc_w0=0) as f_in, h5.File(tmp_path, 'a', rdcc_nbytes=1024*1024, rdcc_nslots=1000, rdcc_w0=0) as f_tmp:
         if sum_mode:
-            mask[:,:remaining_idx] = 0
+            # Events before remaining_idx are already in the reduced file (resumed run)
+            step_events = [ev[np.searchsorted(ev, remaining_idx):] for ev in step_events]
         
         if ref_arr_available:
             data = f_in[arr[0]]
@@ -57,26 +80,46 @@ def process_chunk(chunk_idx, chunk_indices, mask, arr, remaining_idx, virtual_fi
             std_key = f"{arr_name}_std"
             f_tmp_std = f_tmp.create_dataset(std_key, shape=data_shape, dtype='f', chunks=chunk_shape)
 
+        # Events are read for a batch of steps at a time (see READ_BLOCK_BYTES); a batch always
+        # holds at least one whole step.
+        row_bytes = max(1, int(np.prod(_data_shape[1:])) * data.dtype.itemsize)
+        events_per_read = max(1, READ_BLOCK_BYTES // row_bytes)
+        batch_end = 0
+        batch_events = np.empty(0, dtype=np.int64)
+        data_batch = ref_batch = None
+
         local_count = 0
         for idx, i in enumerate(chunk_indices):
+            if idx >= batch_end:
+                # Start a new batch: take steps until the event budget is used up
+                n_batch = len(step_events[idx])
+                batch_end = idx + 1
+                while batch_end < len(chunk_indices) and n_batch + len(step_events[batch_end]) <= events_per_read:
+                    n_batch += len(step_events[batch_end])
+                    batch_end += 1
+                del data_batch, ref_batch
+                batch_events = np.unique(np.concatenate(step_events[idx:batch_end])) if n_batch else np.empty(0, dtype=np.int64)
+                data_batch = read_events(data, batch_events)
+                ref_batch = read_events(ref_data, batch_events) if ref_arr_available else None
+
+            indices = step_events[idx]
+            rows = np.searchsorted(batch_events, indices)      # where this step's events sit in the batch
             if sum_mode:
-                indices = np.where(mask[i])[0]
                 if len(indices) == 0:
                     step_val = np.zeros(_data_shape[1:])
                 else:
-                    step_val = np.sum(np.where(ref_data[indices]!=0, data[indices]/ref_data[indices], 0), axis=0) if ref_arr_available else np.sum(data[indices], axis=0)
+                    step_val = np.sum(np.where(ref_batch[rows]!=0, data_batch[rows]/ref_batch[rows], 0), axis=0) if ref_arr_available else np.sum(data_batch[rows], axis=0)
                 f_tmp_sum[idx, :] = step_val
                 f_tmp_count[idx] = len(indices)
             else:
-                indices = np.where(mask[i])[0]
                 if len(indices) == 0:
                     mean_step = np.zeros(_data_shape[1:], dtype=float)
                     mean_std_step = np.zeros(_data_shape[1:], dtype=float)
                 elif len(indices) == 1:
-                    mean_step = np.array(np.where(ref_data[indices[0]]!=0, data[indices[0]]/ref_data[indices[0]], 0), dtype=float) if ref_arr_available else np.array(data[indices[0]], dtype=float)
+                    mean_step = np.array(np.where(ref_batch[rows[0]]!=0, data_batch[rows[0]]/ref_batch[rows[0]], 0), dtype=float) if ref_arr_available else np.array(data_batch[rows[0]], dtype=float)
                     mean_std_step = np.zeros_like(mean_step)
                 else:
-                    block = np.where(ref_data[indices]!=0, data[indices]/ref_data[indices], 0) if ref_arr_available else data[indices]
+                    block = np.where(ref_batch[rows]!=0, data_batch[rows]/ref_batch[rows], 0) if ref_arr_available else data_batch[rows]
                     n_std = n_std_filter
                     median_step = np.median(block, axis=0, keepdims=True)
                     std_step = np.std(block, axis=0, keepdims=True)
@@ -112,10 +155,13 @@ def process_chunk(chunk_idx, chunk_indices, mask, arr, remaining_idx, virtual_fi
                     counter.value += local_count
                 local_count = 0
             if sum_mode:
-                del step_val, indices
+                del step_val, indices, rows
             else:
-                del mean_step, mean_std_step, indices
-            gc.collect()
+                del mean_step, mean_std_step, indices, rows
+            # No gc.collect() here: the arrays of a step are freed as soon as they are deleted
+            # (numpy arrays have no reference cycles), while a full collection costs tens of
+            # milliseconds - far more than the step itself. One collection per chunk follows below.
+        del data_batch, ref_batch, batch_events
         if sum_mode:
             f_tmp_sum.flush()
             f_tmp_count.flush()
@@ -136,7 +182,7 @@ def process_chunk(chunk_idx, chunk_indices, mask, arr, remaining_idx, virtual_fi
         f_tmp.attrs['done'] = True
     return tmp_path, chunk_indices, arr_name
 
-def dry_run_process_chunk(chunk_idx, chunk_indices, mask, arrays, remaining_events, virtual_file_path, tmp_dir, sum_mode, n_std_filter, batch_size=10):
+def dry_run_process_chunk(chunk_idx, chunk_indices, step_events, arrays, remaining_events, virtual_file_path, tmp_dir, sum_mode, n_std_filter, batch_size=10):
     proc = psutil.Process(os.getpid())
     mem = proc.memory_info().rss / (1024 ** 2)
     tmp_path = os.path.join(tmp_dir, f"chunk_{chunk_idx}.h5")
