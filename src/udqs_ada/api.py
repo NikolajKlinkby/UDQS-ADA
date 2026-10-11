@@ -28,7 +28,7 @@ from .scan_helpers import (
 from .model_helpers import process_model_chunk
 
 
-def create_virtual_file(runnr, dataDir, fileprefix='File', overwrite=None):
+def create_virtual_file(runnr, dataDir, fileprefix='File', overwrite=None, n_workers=1):
     """
     Create (or combine) a virtual HDF5 dataset file for a run or multiple runs.
 
@@ -50,6 +50,11 @@ def create_virtual_file(runnr, dataDir, fileprefix='File', overwrite=None):
         If True, overwrite existing virtual dataset files. If False, do not
         overwrite and only add missing sources. If None, prompt the user
         for interactive confirmation when necessary.
+    - n_workers: int, optional
+        Number of processes used to read the raw files, one file per process
+        (default 1: read them one after the other). The result is the same
+        for any value. With more than one, a script must make this call
+        inside `if __name__ == '__main__':`, as for `compute_scan_avg`.
 
     Returns:
     - int
@@ -66,7 +71,7 @@ def create_virtual_file(runnr, dataDir, fileprefix='File', overwrite=None):
         files_changed = 0
         for r in runnr:
             vds_files.append(os.path.join(dataDir, 'Run-' + r + '_VirtualData.h5'))
-            files_changed += _create_virtual_file(r,dataDir, fileprefix=fileprefix, overwrite=overwrite)
+            files_changed += _create_virtual_file(r,dataDir, fileprefix=fileprefix, overwrite=overwrite, n_workers=n_workers)
         run_str = "-".join(runnr)
         combined_vds = os.path.join(dataDir, f"Run-{run_str}_VirtualData.h5")
         if files_changed == 0 and os.path.exists(combined_vds) and not overwrite:
@@ -123,7 +128,7 @@ def create_virtual_file(runnr, dataDir, fileprefix='File', overwrite=None):
         print(f"Combined virtual dataset written: {combined_vds}")
         return 1
     else:
-        return _create_virtual_file(runnr,dataDir, fileprefix=fileprefix, overwrite=None)
+        return _create_virtual_file(runnr,dataDir, fileprefix=fileprefix, overwrite=None, n_workers=n_workers)
 
 def compute_scan_avg(runnr, dataDir, arrays, n_std_filter=1.0, use_mask=None, memory_fraction=0.001, sum_mode=True, n_workers=4, 
                      scan_step_array=None, n_scan_bins=None, reference_arrays=None):

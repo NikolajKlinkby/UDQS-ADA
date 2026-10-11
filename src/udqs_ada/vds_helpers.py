@@ -1,6 +1,9 @@
 import h5py as h5
 import numpy as np
 import os
+from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures.process import BrokenProcessPool
+from multiprocessing import get_context
 
 def progress_bar(iteration, total, prefix='', length=50, every=100):
     if iteration % every == 0 or iteration == total:
@@ -78,10 +81,17 @@ def list_h5_datasets(h5_file, path="/"):
     h5_file[path].visit(visitor)
     return datasets
 
-def process_event_group(f, file, key, common_fields, vsource_lists):
-    if 'scan_step' in f[key].attrs and 'scan_cycle' in f[key].attrs:
-        scan_step = f[key].attrs["scan_step"]
-        scan_cycle = f[key].attrs["scan_cycle"]
+def process_event_group(f, file, key, common_fields, vsource_lists, abs_file=None):
+    # Every HDF5 object is opened once and kept in a local variable. Looking a group or dataset
+    # up by name again and again (f[key][group][dataset] ...) was most of the time spent here.
+    if abs_file is None:
+        abs_file = os.path.abspath(file)
+    event = f[key]
+    event_attrs = dict(event.attrs.items())
+
+    if 'scan_step' in event_attrs and 'scan_cycle' in event_attrs:
+        scan_step = event_attrs["scan_step"]
+        scan_cycle = event_attrs["scan_cycle"]
     else:
         scan_step = -1
         scan_cycle = -1
@@ -94,23 +104,23 @@ def process_event_group(f, file, key, common_fields, vsource_lists):
         if field in ['scan_step', 'scan_cycle', 'filenr', 'eventnr']:
             vsource_lists[field].append(np.array([value], dtype=np.int32))
 
-    for attr_key in f[key].attrs.keys():
+    for attr_key, attr_value in event_attrs.items():
         if attr_key.endswith('_mon_val'):
-            attr_value = f[key].attrs[attr_key]
             if attr_key not in vsource_lists:
                 vsource_lists[attr_key] = []
             vsource_lists[attr_key].append(np.array([attr_value], dtype=np.float64))
         elif attr_key.endswith('_set_val'):
-            attr_value = f[key].attrs[attr_key]
             if attr_key not in vsource_lists:
                 vsource_lists[attr_key] = []
             vsource_lists[attr_key].append(np.array([attr_value], dtype=np.float64))
 
-    for group in f[key].keys():
-        proc_time = f[key][group].attrs.get("proc_time", None)
-        rep_rate = f[key][group].attrs.get("rep_rate", None)
-        timestamp = f[key][group].attrs.get("timestamp", None)
-        position = f[key][group].attrs.get("position", None)
+    for group in event.keys():
+        grp = event[group]
+        grp_attrs = dict(grp.attrs.items())
+        proc_time = grp_attrs.get("proc_time", None)
+        rep_rate = grp_attrs.get("rep_rate", None)
+        timestamp = grp_attrs.get("timestamp", None)
+        position = grp_attrs.get("position", None)
 
         for field, value in zip(common_fields[4:], [proc_time, rep_rate, timestamp, position]):
             if value is None:
@@ -122,39 +132,88 @@ def process_event_group(f, file, key, common_fields, vsource_lists):
             elif field == 'timestamp':
                 vsource_lists[group+'/'+field].append(np.array([value], dtype=h5.string_dtype(encoding='utf-8')))
 
-        for attr_key in f[key][group].attrs.keys():
+        for attr_key, attr_value in grp_attrs.items():
             if group + '/' + attr_key not in vsource_lists:
                 vsource_lists[group + '/' + attr_key] = []
-            attr_value = f[key][group].attrs[attr_key]
             if isinstance(attr_value, (str, bytes)):
                 vsource_lists[group + '/' + attr_key].append(np.array([attr_value], dtype=h5.string_dtype(encoding='utf-8')))
             else:
                 vsource_lists[group + '/' + attr_key].append(np.array([attr_value], dtype=np.float64))
 
-        for dataset in f[key][group].keys():
-            if isinstance(f[key][group][dataset], h5.Dataset):
-                dataset_path = f[key][group][dataset].name
+        for dataset in grp.keys():
+            obj = grp[dataset]
+            if isinstance(obj, h5.Dataset):
+                dataset_path = obj.name
                 dataset_name = group + '/' + dataset_path.split("/")[-1]
-                dataset_shape = f[key][group][dataset].shape
-                dataset_dtype = f[key][group][dataset].dtype
+                dataset_shape = obj.shape
+                dataset_dtype = obj.dtype
 
                 if dataset_name not in vsource_lists:
                     vsource_lists[dataset_name] = []
 
-                vsource = h5.VirtualSource(os.path.abspath(file), dataset_path, shape=dataset_shape, dtype=dataset_dtype)
+                vsource = h5.VirtualSource(abs_file, dataset_path, shape=dataset_shape, dtype=dataset_dtype)
                 vsource_lists[dataset_name].append(vsource)
 
-def process_files(fileList, common_fields, last_event, vsource_lists):
-    progress_counter = 0
-    for file in fileList:
-        with h5.File(file, 'r', swmr=True) as f:
-            for key in f.keys():
-                if key.startswith('Event_'):
-                    process_event_group(f, file, key, common_fields, vsource_lists)
-                    progress_counter += 1
-                    progress_bar(progress_counter, last_event, prefix="Progress")
+def _read_file(args):
+    """Worker for process_files: read one raw file and return what it contributes, in a form
+    that can be sent between processes. Virtual sources are returned as
+    (dataset path, shape, dtype) and rebuilt in the parent."""
+    file, common_fields = args
+    abs_file = os.path.abspath(file)
+    lists = {}
+    n_events = 0
+    with h5.File(file, 'r', swmr=True) as f:
+        for key in f.keys():
+            if key.startswith('Event_'):
+                process_event_group(f, file, key, common_fields, lists, abs_file)
+                n_events += 1
+    out = []
+    for name, items in lists.items():
+        if items and isinstance(items[0], h5.VirtualSource):
+            out.append((name, True, [(vs.name, vs.shape, vs.dtype) for vs in items]))
+        else:
+            out.append((name, False, items))
+    return abs_file, n_events, out
 
-def _create_virtual_file(runnr, dataDir, fileprefix='File', overwrite=None):
+
+def process_files(fileList, common_fields, last_event, vsource_lists, n_workers=1):
+    """Read every event of every file into vsource_lists.
+
+    With n_workers > 1 the files are read in parallel, one process per file, and merged in file
+    order, which gives exactly the same result as reading them one after the other."""
+    n_workers = max(1, min(int(n_workers or 1), len(fileList)))
+    progress_counter = 0
+    if n_workers == 1:
+        for file in fileList:
+            abs_file = os.path.abspath(file)
+            with h5.File(file, 'r', swmr=True) as f:
+                for key in f.keys():
+                    if key.startswith('Event_'):
+                        process_event_group(f, file, key, common_fields, vsource_lists, abs_file)
+                        progress_counter += 1
+                        progress_bar(progress_counter, last_event, prefix="Progress")
+        return
+
+    # 'spawn' so the workers start clean on every platform and inherit no open HDF5 files
+    try:
+        with ProcessPoolExecutor(max_workers=n_workers, mp_context=get_context('spawn')) as pool:
+            for abs_file, n_events, lists in pool.map(_read_file, [(file, common_fields) for file in fileList]):
+                for name, is_source, items in lists:
+                    target = vsource_lists.setdefault(name, [])
+                    if is_source:
+                        target.extend(h5.VirtualSource(abs_file, path, shape=shape, dtype=dtype) for path, shape, dtype in items)
+                    else:
+                        target.extend(items)
+                progress_counter += n_events
+                progress_bar(progress_counter, last_event, prefix="Progress")
+    except BrokenProcessPool as e:
+        raise RuntimeError(
+            "Reading the files in parallel failed because a worker process died. If this is a "
+            "script, the calls must be inside `if __name__ == '__main__':` (as for "
+            "compute_scan_avg); otherwise use n_workers=1."
+        ) from e
+
+def _create_virtual_file(runnr, dataDir, fileprefix='File', overwrite=None, n_workers=1):
     """
     Internal helper that builds (or updates) the virtual dataset file for a
     single run. This inspects HDF5 files in `dataDir/Run-<runnr>`, identifies
@@ -171,6 +230,8 @@ def _create_virtual_file(runnr, dataDir, fileprefix='File', overwrite=None):
         Prefix to identify data files inside the run directory.
     - overwrite: bool or None, optional
         Controls behavior when the target virtual file already exists.
+    - n_workers: int, optional
+        Number of processes used to read the raw files (default 1).
 
     Returns:
     - int
@@ -235,7 +296,7 @@ def _create_virtual_file(runnr, dataDir, fileprefix='File', overwrite=None):
                 first_event -= 1
                 vsource_lists = {}
                 common_fields = ['scan_step', 'scan_cycle', 'filenr', 'eventnr', 'proc_time', 'rep_rate', 'timestamp', 'position']
-                process_files(files_to_process, common_fields, last_event-first_event, vsource_lists)
+                process_files(files_to_process, common_fields, last_event-first_event, vsource_lists, n_workers=n_workers)
                 scan_val_dict = {}
                 with h5.File(vds_file, 'a') as vds:
                     for dataset_name, vsource_list in vsource_lists.items():
@@ -300,7 +361,7 @@ def _create_virtual_file(runnr, dataDir, fileprefix='File', overwrite=None):
     with h5.File(vds_file, 'w') as vds:
         vsource_lists = {}
         common_fields = ['scan_step', 'scan_cycle', 'filenr', 'eventnr', 'proc_time', 'rep_rate', 'timestamp', 'position']
-        process_files(fileList, common_fields, last_event-first_event, vsource_lists)
+        process_files(fileList, common_fields, last_event-first_event, vsource_lists, n_workers=n_workers)
         scan_val_dict = {}
         for dataset_name, vsource_list in vsource_lists.items():
             if isinstance(vsource_list[0], np.ndarray):
